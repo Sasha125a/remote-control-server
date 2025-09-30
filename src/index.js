@@ -1,180 +1,208 @@
+const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
 const cors = require('cors');
-require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
-});
+const wss = new WebSocket.Server({ server });
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
 // Хранилище подключенных клиентов
-const connectedClients = new Map();
+const clients = new Map();
 
-// REST API маршруты
-app.use('/api', require('./routes/commands'));
+wss.on('connection', (ws) => {
+    const clientId = generateClientId();
+    console.log('New WebSocket connection:', clientId);
 
-// Socket.io соединения
-io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
-
-  // Регистрация Windows клиента
-  socket.on('register-windows-client', (clientInfo) => {
-    connectedClients.set(socket.id, {
-      type: 'windows',
-      socket: socket,
-      info: clientInfo
+    clients.set(clientId, {
+        ws: ws,
+        type: null,
+        info: null
     });
-    console.log('Windows client registered:', clientInfo);
-    
-    // Отправляем подтверждение
-    socket.emit('registration-success', {
-      message: 'Windows client registered successfully',
-      clientId: socket.id
-    });
-  });
 
-  // Регистрация Android клиента
-  socket.on('register-android-client', (clientInfo) => {
-    connectedClients.set(socket.id, {
-      type: 'android',
-      socket: socket,
-      info: clientInfo
+    // Обработка сообщений от клиента
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            handleMessage(clientId, data);
+        } catch (error) {
+            console.error('Message parse error:', error);
+            sendToClient(ws, {
+                type: 'error',
+                data: { message: 'Invalid JSON format' }
+            });
+        }
     });
-    console.log('Android client registered:', clientInfo);
-    
-    socket.emit('registration-success', {
-      message: 'Android client registered successfully',
-      clientId: socket.id
-    });
-  });
 
-  // Получение команды от Android и пересылка на Windows
-  socket.on('send-command', (commandData) => {
-    console.log('Command received from Android:', commandData);
-    
-    // Находим все подключенные Windows клиенты
-    const windowsClients = Array.from(connectedClients.values())
-      .filter(client => client.type === 'windows');
-    
-    if (windowsClients.length === 0) {
-      socket.emit('command-error', {
-        message: 'No Windows clients connected'
-      });
-      return;
+    // Обработка отключения
+    ws.on('close', () => {
+        console.log('Client disconnected:', clientId);
+        clients.delete(clientId);
+        broadcastClientsList();
+    });
+
+    // Обработка ошибок
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+        clients.delete(clientId);
+    });
+
+    // Отправляем приветственное сообщение
+    sendToClient(ws, {
+        type: 'connection-established',
+        data: { clientId, message: 'Connected to server' }
+    });
+});
+
+function handleMessage(clientId, message) {
+    const client = clients.get(clientId);
+    if (!client) return;
+
+    switch (message.type) {
+        case 'register-client':
+            handleClientRegistration(clientId, message.data);
+            break;
+            
+        case 'command-result':
+            handleCommandResult(message.data);
+            break;
+            
+        case 'ping':
+            sendToClient(client.ws, { type: 'pong' });
+            break;
+            
+        case 'pong':
+            // Обработка pong (можно обновить время последней активности)
+            break;
+            
+        default:
+            console.log('Unknown message type:', message.type);
     }
+}
 
-    // Отправляем команду первому доступному Windows клиенту
-    const targetClient = windowsClients[0];
-    targetClient.socket.emit('execute-command', commandData);
+function handleClientRegistration(clientId, clientInfo) {
+    const client = clients.get(clientId);
+    if (!client) return;
+
+    client.type = clientInfo.clientType;
+    client.info = clientInfo;
     
-    // Подтверждаем отправку
-    socket.emit('command-sent', {
-      message: 'Command sent to Windows client',
-      command: commandData
+    console.log(`Client registered: ${clientInfo.clientType} - ${clientInfo.hostname}`);
+    
+    sendToClient(client.ws, {
+        type: 'registration-success',
+        data: { 
+            message: `${clientInfo.clientType} client registered successfully`,
+            clientId 
+        }
     });
-  });
+    
+    broadcastClientsList();
+}
 
-  // Результат выполнения команды от Windows клиента
-  socket.on('command-result', (result) => {
-    console.log('Command result from Windows:', result);
-    
-    // Пересылаем результат обратно на Android
-    const androidClients = Array.from(connectedClients.values())
-      .filter(client => client.type === 'android');
-    
-    androidClients.forEach(client => {
-      client.socket.emit('command-result', result);
+function handleCommandResult(result) {
+    // Пересылаем результат всем Android клиентам
+    clients.forEach((client, clientId) => {
+        if (client.type === 'android') {
+            sendToClient(client.ws, {
+                type: 'command-result',
+                data: result
+            });
+        }
     });
-  });
+}
 
-  // Отслеживание отключения клиента
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-    connectedClients.delete(socket.id);
-  });
-
-  // Получение списка подключенных клиентов
-  socket.on('get-connected-clients', () => {
-    const clients = Array.from(connectedClients.values()).map(client => ({
-      type: client.type,
-      info: client.info,
-      id: client.socket.id
-    }));
+// Функция для отправки команды на Windows клиент
+function sendCommandToWindows(command, parameter = null) {
+    let sent = false;
     
-    socket.emit('connected-clients-list', clients);
-  });
-});
+    clients.forEach((client, clientId) => {
+        if (client.type === 'windows' && !sent) {
+            sendToClient(client.ws, {
+                type: 'execute-command',
+                data: { command, parameter }
+            });
+            sent = true;
+        }
+    });
+    
+    return sent;
+}
 
-// REST endpoint для проверки статуса
-app.get('/health', (req, res) => {
-  const clients = Array.from(connectedClients.values()).map(client => ({
-    type: client.type,
-    info: client.info
-  }));
-  
-  res.json({
-    status: 'OK',
-    connectedClients: clients.length,
-    clients: clients
-  });
-});
+function broadcastClientsList() {
+    const clientsList = Array.from(clients.values())
+        .filter(client => client.type)
+        .map(client => ({
+            type: client.type,
+            info: client.info
+        }));
+    
+    clients.forEach((client) => {
+        if (client.type === 'android') {
+            sendToClient(client.ws, {
+                type: 'clients-update',
+                data: { clients: clientsList }
+            });
+        }
+    });
+}
+
+function sendToClient(ws, message) {
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(message));
+    }
+}
+
+function generateClientId() {
+    return Math.random().toString(36).substring(2, 15);
+}
 
 // REST endpoint для отправки команд через HTTP
 app.post('/api/command', (req, res) => {
-  const { command, parameter, clientId } = req.body;
-  
-  const commandData = {
-    command,
-    parameter,
-    timestamp: new Date().toISOString(),
-    source: 'http'
-  };
-
-  // Если указан конкретный клиент
-  if (clientId) {
-    const targetClient = connectedClients.get(clientId);
-    if (targetClient && targetClient.type === 'windows') {
-      targetClient.socket.emit('execute-command', commandData);
-      return res.json({ 
-        success: true, 
-        message: 'Command sent to specific client',
-        clientId 
-      });
+    const { command, parameter } = req.body;
+    
+    if (!command) {
+        return res.status(400).json({ error: 'Command is required' });
     }
-  }
+    
+    const sent = sendCommandToWindows(command, parameter);
+    
+    if (sent) {
+        res.json({ 
+            success: true, 
+            message: 'Command sent to Windows client',
+            command 
+        });
+    } else {
+        res.status(404).json({ 
+            success: false, 
+            error: 'No Windows clients connected' 
+        });
+    }
+});
 
-  // Ищем любой Windows клиент
-  const windowsClients = Array.from(connectedClients.values())
-    .filter(client => client.type === 'windows');
-  
-  if (windowsClients.length === 0) {
-    return res.status(400).json({
-      success: false,
-      message: 'No Windows clients connected'
+// Health check endpoint
+app.get('/health', (req, res) => {
+    const windowsClients = Array.from(clients.values())
+        .filter(client => client.type === 'windows').length;
+        
+    const androidClients = Array.from(clients.values())
+        .filter(client => client.type === 'android').length;
+    
+    res.json({
+        status: 'OK',
+        connectedClients: clients.size,
+        windowsClients,
+        androidClients,
+        timestamp: new Date().toISOString()
     });
-  }
-
-  windowsClients[0].socket.emit('execute-command', commandData);
-  
-  res.json({
-    success: true,
-    message: 'Command sent to Windows client',
-    clientsAvailable: windowsClients.length
-  });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`WebSocket server available at ws://localhost:${PORT}`);
+    console.log(`WebSocket server running on port ${PORT}`);
+    console.log(`REST API available at http://localhost:${PORT}`);
 });
